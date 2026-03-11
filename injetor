@@ -1,0 +1,99 @@
+// clang++ injetor-hide0.cpp -std=c++17 -O2 -s -Wl,--subsystem,console -o hide0.exe
+#include <windows.h>
+#include <tlhelp32.h>
+#include <string>
+#include <vector>
+#include <iostream>
+
+/* --------------- proto undocumented --------------- */
+using fZwCreateThreadEx = NTSTATUS (WINAPI *)(
+    PHANDLE, ACCESS_MASK, PVOID, HANDLE,
+    LPTHREAD_START_ROUTINE, PVOID,
+    ULONG, SIZE_T, SIZE_T, SIZE_T, PVOID);
+
+DWORD GetProcId(const char* name)
+{
+    DWORD pid = 0;
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    PROCESSENTRY32 pe{ sizeof(pe) };
+    for (BOOL ok = Process32First(snap, &pe);
+         ok;
+         ok = Process32Next(snap, &pe))
+    {
+        if (!_stricmp(pe.szExeFile, name)) { pid = pe.th32ProcessID; break; }
+    }
+    CloseHandle(snap);
+    return pid;
+}
+
+bool InjectHide0(DWORD pid, const std::string& dll)
+{
+    /* 1) abrir processo */
+    HANDLE hp = OpenProcess(PROCESS_ALL_ACCESS, FALSE, pid);
+    if (!hp) return false;
+
+    /* 2) alocar e escrever caminho */
+    SIZE_T size = dll.size() + 1;
+    LPVOID pathAddr = VirtualAllocEx(hp, nullptr, size,
+                                      MEM_COMMIT | MEM_RESERVE,
+                                      PAGE_READWRITE);
+    if (!pathAddr){ CloseHandle(hp); return false; }
+    WriteProcessMemory(hp, pathAddr, dll.c_str(), size, nullptr);
+
+    /* 3) resolver LoadLibraryA dentro do alvo */
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    LPTHREAD_START_ROUTINE loadLib =
+            (LPTHREAD_START_ROUTINE)GetProcAddress(k32, "LoadLibraryA");
+
+    /* 4) puxar ZwCreateThreadEx */
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    auto _ZwCreateThreadEx =
+        (fZwCreateThreadEx)GetProcAddress(ntdll, "ZwCreateThreadEx");
+    if (!_ZwCreateThreadEx) { VirtualFreeEx(hp, pathAddr, 0, MEM_RELEASE);
+                              CloseHandle(hp); return false; }
+
+    /* 5) criar thread oculta */
+    HANDLE hThread = nullptr;
+    NTSTATUS st = _ZwCreateThreadEx(&hThread, THREAD_ALL_ACCESS, nullptr, hp,
+                                      loadLib, pathAddr,
+                                      0x1, /* HIDE_FROM_DEBUGGER */
+                                      0, 0, 0, nullptr);
+    if (st != 0 || !hThread){
+        VirtualFreeEx(hp, pathAddr, 0, MEM_RELEASE);
+        CloseHandle(hp);
+        return false;
+    }
+
+    WaitForSingleObject(hThread, INFINITE);
+    VirtualFreeEx(hp, pathAddr, 0, MEM_RELEASE);
+    CloseHandle(hThread);
+    CloseHandle(hp);
+    return true;
+}
+
+int main()
+{
+    std::cout << "[hide0] injetor lunar-proof\n";
+
+    const char* target = "javaw.exe";
+    DWORD pid = GetProcId(target);
+    if (!pid){ std::cout << "Processo nao encontrado\n"; return 0; }
+
+    /* DLLs que ficam na mesma pasta do injetor */
+    std::vector<std::string> dlls = { "slinky_library.dll", "slinkyhook.dll" };
+
+    char selfDir[MAX_PATH];
+    GetModuleFileNameA(nullptr, selfDir, MAX_PATH);
+    std::string dir(selfDir);
+    dir = dir.substr(0, dir.find_last_of("\\/"));
+
+    for (auto& name : dlls){
+        std::string full = dir + "\\" + name;
+        if (InjectHide0(pid, full))
+            std::cout << "[+] " << name << " ok\n";
+        else
+            std::cout << "[-] " << name << " falhou\n";
+    }
+    return 0;
+}
